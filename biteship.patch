@@ -1,0 +1,269 @@
+diff --git a/composer.json b/composer.json
+new file mode 100644
+index 0000000..d9f7f1b
+--- /dev/null
++++ b/composer.json
+@@
++{
++  "name": "cingobean/biteship-shipping",
++  "type": "botble-plugin",
++  "autoload": {
++    "psr-4": {
++      "Plugin\\BiteshipShipping\\": "src/"
++    },
++    "files": [
++      "helpers/constants.php"
++    ]
++  }
++}
+
+diff --git a/plugin.json b/plugin.json
+new file mode 100644
+index 0000000..c1a2b11
+--- /dev/null
++++ b/plugin.json
+@@
++{
++  "id": "cingobean/biteship-shipping",
++  "name": "Biteship",
++  "namespace": "Plugin\\\\BiteshipShipping\\\\",
++  "provider": "Plugin\\\\BiteshipShipping\\\\Providers\\\\BiteshipShippingServiceProvider",
++  "author": "cingobean",
++  "url": "https://github.com/cingobean/biteship-shipping",
++  "version": "1.0.0",
++  "description": "Biteship Shipping integration for Botble Ecommerce"
++}
+
+diff --git a/helpers/constants.php b/helpers/constants.php
+new file mode 100644
+index 0000000..e13d9a1
+--- /dev/null
++++ b/helpers/constants.php
+@@
++<?php
++if (!defined('BITESHIP_SHIPPING_METHOD_NAME')) {
++    define('BITESHIP_SHIPPING_METHOD_NAME', 'biteship');
++}
+
+diff --git a/routes/web.php b/routes/web.php
+new file mode 100644
+index 0000000..b7c1f3e
+--- /dev/null
++++ b/routes/web.php
+@@
++<?php
++
++use Illuminate\Support\Facades\Route;
++use Plugin\BiteshipShipping\Http\Controllers\BiteshipShipmentController;
++use Plugin\BiteshipShipping\Http\Controllers\BiteshipWebhookController;
++
++Route::post('biteship/create-shipment/{orderId}', [BiteshipShipmentController::class, 'create']);
++Route::post('biteship/webhook', [BiteshipWebhookController::class, 'handle']);
+
+diff --git a/src/Providers/BiteshipShippingServiceProvider.php b/src/Providers/BiteshipShippingServiceProvider.php
+new file mode 100644
+index 0000000..8a7f1cd
+--- /dev/null
++++ b/src/Providers/BiteshipShippingServiceProvider.php
+@@
++<?php
++
++namespace Plugin\BiteshipShipping\Providers;
++
++use Illuminate\Support\ServiceProvider;
++
++class BiteshipShippingServiceProvider extends ServiceProvider
++{
++    public function register(): void
++    {
++        $this->app->register(HookServiceProvider::class);
++    }
++
++    public function boot(): void
++    {
++        // nothing
++    }
++}
+
+diff --git a/src/Providers/HookServiceProvider.php b/src/Providers/HookServiceProvider.php
+new file mode 100644
+index 0000000..de9c2ab
+--- /dev/null
++++ b/src/Providers/HookServiceProvider.php
+@@
++<?php
++
++namespace Plugin\BiteshipShipping\Providers;
++
++use Illuminate\Support\ServiceProvider;
++use Plugin\BiteshipShipping\Shipping\BiteshipShippingMethod;
++
++class HookServiceProvider extends ServiceProvider
++{
++    public function boot(): void
++    {
++        if (!defined('ECOMMERCE_MODULE_SCREEN_NAME')) {
++            return;
++        }
++
++        add_filter('ecommerce_shipping_methods', [$this, 'registerBiteship'], 20);
++    }
++
++    public function registerBiteship(array $methods): array
++    {
++        if (!setting('shipping_biteship_status')) {
++            return $methods;
++        }
++
++        $methods[BITESHIP_SHIPPING_METHOD_NAME] = [
++            'id'    => BITESHIP_SHIPPING_METHOD_NAME,
++            'name'  => 'Biteship',
++            'class' => BiteshipShippingMethod::class,
++        ];
++
++        return $methods;
++    }
++}
+
+diff --git a/src/Shipping/BiteshipShippingMethod.php b/src/Shipping/BiteshipShippingMethod.php
+new file mode 100644
+index 0000000..3b19c91
+--- /dev/null
++++ b/src/Shipping/BiteshipShippingMethod.php
+@@
++<?php
++
++namespace Plugin\BiteshipShipping\Shipping;
++
++use Illuminate\Support\Facades\Http;
++
++class BiteshipShippingMethod
++{
++    public function getAvailableShippingMethods($order): array
++    {
++        $apiKey = setting('biteship_api_key');
++        if (!$apiKey || !$order || !$order->address) {
++            return [];
++        }
++
++        $payload = [
++            'origin_postal_code'      => setting('biteship_origin_postal_code'),
++            'destination_postal_code' => $order->address->zip_code,
++            'couriers'                => setting('biteship_couriers', 'jne,jnt,sicepat,pos'),
++            'items' => $order->products->map(function ($item) {
++                return [
++                    'name'     => $item->product_name,
++                    'quantity' => $item->qty,
++                    'weight'   => max(1, (int) $item->weight),
++                    'price'    => (int) $item->price,
++                ];
++            })->toArray(),
++        ];
++
++        $res = Http::withToken($apiKey)
++            ->post('https://api.biteship.com/v1/rates/couriers', $payload);
++
++        if (!$res->successful()) {
++            return [];
++        }
++
++        $rates = [];
++        foreach ($res->json('pricing', []) as $courier) {
++            foreach ($courier['services'] as $service) {
++                $rates[] = [
++                    'name'  => strtoupper($courier['courier_name']) . ' ' . $service['service_name'],
++                    'code'  => 'biteship_' . $courier['courier_code'] . '_' . $service['service_code'],
++                    'price' => (int) $service['price'],
++                    'etd'   => $service['etd'],
++                ];
++            }
++        }
++
++        return $rates;
++    }
++}
+
+diff --git a/src/Http/Controllers/BiteshipShipmentController.php b/src/Http/Controllers/BiteshipShipmentController.php
+new file mode 100644
+index 0000000..a8b21f3
+--- /dev/null
++++ b/src/Http/Controllers/BiteshipShipmentController.php
+@@
++<?php
++
++namespace Plugin\BiteshipShipping\Http\Controllers;
++
++use Illuminate\Routing\Controller;
++use Illuminate\Support\Facades\Http;
++use Botble\Ecommerce\Models\Order;
++
++class BiteshipShipmentController extends Controller
++{
++    public function create(int $orderId)
++    {
++        $order = Order::findOrFail($orderId);
++
++        $payload = [
++            'reference_id' => 'ORDER-' . $order->id,
++            'origin_postal_code' => setting('biteship_origin_postal_code'),
++            'destination_postal_code' => $order->address->zip_code,
++            'delivery_type' => 'pickup',
++            'items' => $order->products->map(fn ($item) => [
++                'name'     => $item->product_name,
++                'price'    => (int) $item->price,
++                'quantity' => $item->qty,
++            ])->toArray(),
++        ];
++
++        $res = Http::withToken(setting('biteship_api_key'))
++            ->post('https://api.biteship.com/v1/orders', $payload);
++
++        abort_unless($res->successful(), 400);
++
++        return response()->json($res->json());
++    }
++}
+
+diff --git a/src/Http/Controllers/BiteshipWebhookController.php b/src/Http/Controllers/BiteshipWebhookController.php
+new file mode 100644
+index 0000000..bb219fa
+--- /dev/null
++++ b/src/Http/Controllers/BiteshipWebhookController.php
+@@
++<?php
++
++namespace Plugin\BiteshipShipping\Http\Controllers;
++
++use Illuminate\Routing\Controller;
++use Illuminate\Http\Request;
++use Botble\Ecommerce\Models\Order;
++
++class BiteshipWebhookController extends Controller
++{
++    public function handle(Request $request)
++    {
++        $ref = $request->input('reference_id');
++        if (!$ref) {
++            return response()->json(['success' => false], 400);
++        }
++
++        $orderId = (int) str_replace('ORDER-', '', $ref);
++        $order = Order::find($orderId);
++
++        if (!$order) {
++            return response()->json(['success' => false], 404);
++        }
++
++        $status = $request->input('status');
++
++        if ($status === 'delivered') {
++            $order->status = 'completed';
++        } elseif ($status === 'cancelled') {
++            $order->status = 'cancelled';
++        }
++
++        $order->save();
++
++        return response()->json(['success' => true]);
++    }
++}
